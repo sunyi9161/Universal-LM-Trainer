@@ -31,7 +31,7 @@
    - 只在优化器 step 边界落盘，恢复时按已消费样本数重放采样器
    - 数据指纹（tokenizer + 分桶计数 + BOS/EOS 开关）不匹配时拒绝恢复
 9. BOS/EOS 监督（默认开启）
-   - 每个样本编码为 [BOS] + 正文 + [EOS]，超长截断正文
+   - 每个样本编码为 [BOS] + 正文 + [EOS]，超长文档在编码时丢弃（不截断）
    - --no-bos / --no-eos 可关闭，开关写入数据指纹
    - 文本里字面出现的 "<bos>"/"<eos>" 按普通 BPE 编码
 10. FlashAttention-2
@@ -1089,7 +1089,8 @@ class FlatBucketCache:
     """
     def __init__(self, cache_id_dir: str, bucket_boundaries: List[int], force: bool = False,
                  data_dir: str = './data', tokenizer=None, max_seq_len: int = 4096,
-                 seed: int = 42, max_samples: Optional[int] = None):
+                 seed: int = 42, max_samples: Optional[int] = None,
+                 reserved_tokens: int = 0):
         self.src_dir = cache_id_dir
         self.flat_dir = os.path.join(cache_id_dir, 'flat_u16')
         self.manifest_path = os.path.join(self.flat_dir, 'manifest.json')
@@ -1098,6 +1099,14 @@ class FlatBucketCache:
         self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+        # BOS/EOS 占用的 token 数。编码时只保留 body + reserved <= max_seq_len
+        # 的文档，超长文档直接丢弃，绝不在 collate 阶段截断。
+        self.reserved_tokens = int(reserved_tokens)
+        self.max_body_len = int(max_seq_len) - self.reserved_tokens
+        if self.max_body_len <= 0:
+            raise ValueError(
+                f"max_seq_len={max_seq_len} 必须大于 BOS/EOS 保留的 "
+                f"{self.reserved_tokens} 个 token")
         self.seed = seed
         self.max_samples = max_samples
         self.info = {}
@@ -1136,6 +1145,11 @@ class FlatBucketCache:
             if m.get('version') != CACHE_FORMAT_VERSION:
                 return False
             if m.get('bucket_boundaries') != self.bucket_boundaries:
+                return False
+            if (m.get('reserved_tokens') != self.reserved_tokens or
+                    m.get('max_body_len') != self.max_body_len):
+                print("  ⚠️ 缓存的数据丢弃策略与当前 BOS/EOS 设置不一致，"
+                      "需要重新编码（旧缓存不会被删除）")
                 return False
             # 用 JSONL 指纹校验输入数据是否变化。
             # 兼容两种旧 manifest：
@@ -1213,6 +1227,7 @@ class FlatBucketCache:
         buckets_info = {}
         t_start = time.time()
         total_written = 0
+        skipped_long = 0
         for boundary in tqdm(self.bucket_boundaries, desc="转换分桶", unit="bucket"):
             chunk_files = sorted(glob.glob(os.path.join(self.src_dir, f'bucket_{boundary}', 'chunk_*.pkl')))
             tok_path = os.path.join(self.flat_dir, f'bucket_{boundary}.tokens.u16')
@@ -1230,21 +1245,30 @@ class FlatBucketCache:
                     ns = int(samples.shape[0])
                     if ns == 0:
                         continue
-                    chunk_tokens = int(lengths.sum())
+
+                    # 超长文档直接丢弃，绝不截断。
+                    keep = lengths <= self.max_body_len
+                    n_keep = int(keep.sum())
+                    skipped_long += ns - n_keep
+                    if n_keep == 0:
+                        del meta, samples, lengths, keep
+                        continue
+                    kept_lengths = lengths[keep]
+                    chunk_tokens = int(kept_lengths.sum())
 
                     # 去掉 padding，平铺写入（uint16 足够：vocab <= 65536，id 0..65535）
                     flat = np.empty(chunk_tokens, dtype=np.uint16)
                     pos = 0
-                    for i in range(ns):
-                        l = int(lengths[i])
-                        flat[pos:pos + l] = samples[i, :l]
+                    for j in np.nonzero(keep)[0]:
+                        l = int(lengths[j])
+                        flat[pos:pos + l] = samples[j, :l]
                         pos += l
                     flat.tofile(fo)
 
-                    all_lengths.append(lengths)
-                    n_samples += ns
+                    all_lengths.append(kept_lengths)
+                    n_samples += n_keep
                     n_tokens += chunk_tokens
-                    del meta, samples, lengths, flat
+                    del meta, samples, lengths, flat, kept_lengths, keep
 
             lengths_all = (np.concatenate(all_lengths) if all_lengths
                            else np.zeros(0, dtype=np.int64))
@@ -1273,6 +1297,9 @@ class FlatBucketCache:
             'fingerprint': fingerprint,
             'jsonl_fingerprint': self._jsonl_fingerprint(),
             'tokenizer_fingerprint': self._tokenizer_fingerprint(),
+            'reserved_tokens': self.reserved_tokens,
+            'max_body_len': self.max_body_len,
+            'skipped_long': skipped_long,
             'buckets': buckets_info,
             'created_at': time.time(),
         }
@@ -1283,7 +1310,8 @@ class FlatBucketCache:
         self.info = buckets_info
         el = time.time() - t_start
         print(f"✓ 快速缓存生成完成: {total_written/1e9:.2f}B token, "
-              f"{sum(v['num_samples'] for v in buckets_info.values()):,} 样本, 耗时 {timedelta(seconds=int(el))}")
+              f"{sum(v['num_samples'] for v in buckets_info.values()):,} 样本, "
+              f"丢弃超长 {skipped_long:,}, 耗时 {timedelta(seconds=int(el))}")
 
     # ---------- 直接从 JSONL 流式编码（没有旧 pkl 缓存时的回退路径） ----------
     def _convert_from_jsonl(self):
@@ -1335,6 +1363,8 @@ class FlatBucketCache:
                 'file_pos': 0,
                 'total': 0,
                 'skipped_long': 0,
+                'reserved_tokens': self.reserved_tokens,
+                'max_body_len': self.max_body_len,
                 'empty': 0,
                 'bad_json': 0,
                 'buckets': {
@@ -1405,7 +1435,7 @@ class FlatBucketCache:
                         state['file_pos'] = pos_after
                         pbar.update(n_lines)
                         pbar.set_postfix({'有效': f"{state['total']:,}",
-                                          '跳过超长': f"{state['skipped_long']:,}"},
+                                          '丢弃超长': f"{state['skipped_long']:,}"},
                                          refresh=False)
                         lines_since_ckpt += n_lines
                         if lines_since_ckpt >= ckpt_lines or (time.time() - last_ckpt) >= ckpt_sec:
@@ -1427,8 +1457,7 @@ class FlatBucketCache:
 
         self._finalize_from_lengths(state, fingerprint, tok_paths, len_paths, progress_path)
 
-    @staticmethod
-    def _load_progress(path: str, fingerprint) -> Optional[dict]:
+    def _load_progress(self, path: str, fingerprint) -> Optional[dict]:
         if not os.path.exists(path):
             return None
         try:
@@ -1437,6 +1466,9 @@ class FlatBucketCache:
             if state.get('version') != 1:
                 return None
             if state.get('fingerprint') != fingerprint:
+                return None
+            if (state.get('reserved_tokens') != self.reserved_tokens or
+                    state.get('max_body_len') != self.max_body_len):
                 return None
             if 'buckets' not in state:
                 return None
@@ -1531,7 +1563,7 @@ class FlatBucketCache:
                 if l == 0:
                     n_empty += 1
                     continue
-                if l > self.max_seq_len:
+                if l > self.max_body_len:
                     n_long += 1
                     continue
                 b = self.fast_bucket.get_bucket(l)
@@ -1593,6 +1625,9 @@ class FlatBucketCache:
             'fingerprint': fingerprint,
             'jsonl_fingerprint': fingerprint,
             'tokenizer_fingerprint': self._tokenizer_fingerprint(),
+            'reserved_tokens': self.reserved_tokens,
+            'max_body_len': self.max_body_len,
+            'skipped_long': int(state.get('skipped_long', 0)),
             'buckets': buckets_info,
             'created_at': time.time(),
         }
@@ -1606,7 +1641,7 @@ class FlatBucketCache:
         self.info = buckets_info
         print(f"✓ 快速缓存生成完成: {total_written/1e9:.2f}B token, "
               f"{sum(v['num_samples'] for v in buckets_info.values()):,} 样本, "
-              f"跳过超长 {state['skipped_long']:,}, 空文本 {state['empty']:,}, "
+              f"丢弃超长 {state['skipped_long']:,}, 空文本 {state['empty']:,}, "
               f"坏行 {state['bad_json']:,}")
 
     # ---------- 访问 ----------
@@ -1661,8 +1696,10 @@ def collate_pad(batch, eos_id: Optional[int] = None,
     缓存的每个样本就是一篇完整文档：
       - bos_id 不为 None：在样本开头加 BOS；
       - eos_id 不为 None：在样本末尾加 EOS（这正是“文档结束”监督）。
-    长度超过 max_len 时截断正文，保证 [BOS] + 正文 + [EOS] 不超过 max_len
-    （max_seq_len 长度上限）。首 token（BOS）仍只作输入、不产生 loss。
+
+    超长文档在编码阶段就已经丢弃，因此这里只做 padding，绝不截断。
+    如果遇到超过 max_len 的样本，说明缓存是旧版“截断”策略生成的，直接报错，
+    避免悄悄丢掉 token。首 token（BOS）仍只作输入、不产生 loss。
     """
     n = len(batch)
     if n == 0:
@@ -1675,6 +1712,10 @@ def collate_pad(batch, eos_id: Optional[int] = None,
     n_special = n_bos + n_eos
 
     if n_special == 0:
+        if max_len is not None and int(lengths.max()) > int(max_len):
+            raise RuntimeError(
+                f"缓存中有样本长度 {int(lengths.max())} 超过 max_seq_len={max_len}；"
+                "旧版截断缓存不能直接复用，请删除缓存后重新编码。")
         maxlen = int(lengths.max())
         buf = np.zeros((n, maxlen), dtype=np.int64)
         for i, a in enumerate(batch):
@@ -1683,18 +1724,24 @@ def collate_pad(batch, eos_id: Optional[int] = None,
 
     if max_len is None:
         max_len = int(lengths.max()) + n_special
-    new_lengths = np.minimum(lengths + n_special, int(max_len))
-    bodies = np.maximum(new_lengths - n_special, 0)   # 保留的真实 token 数
+    new_lengths = lengths + n_special
+    over = int((new_lengths > int(max_len)).sum())
+    if over:
+        raise RuntimeError(
+            f"{over} 个样本加上 BOS/EOS 后超过 max_seq_len={max_len}；"
+            "旧版截断缓存不能直接复用，请删除缓存后重新编码"
+            "（现在超长文档会在编码时丢弃，不截断）。")
+
     maxlen = int(new_lengths.max())
     buf = np.zeros((n, maxlen), dtype=np.int64)
     for i, a in enumerate(batch):
-        body = int(bodies[i])
+        body = int(lengths[i])
         off = 0
         if bos_id is not None:
             buf[i, 0] = bos_id
             off = 1
         if body > 0:
-            buf[i, off:off + body] = a[:body]
+            buf[i, off:off + body] = a
         if eos_id is not None:
             buf[i, off + body] = eos_id
     return torch.from_numpy(buf)
@@ -2748,9 +2795,14 @@ def main():
 
     bucket_boundaries = build_bucket_boundaries(max_seq_len)
 
-    # cache id 只由 tokenizer / 序列长度 / 分桶 / 采样种子决定，与模型结构无关，
-    # 因此换模型大小可以直接复用同一份缓存。
-    hash_input = f"{len(tokenizer)}_{max_seq_len}_None_{train_config.seed}_5000"
+    # BOS/EOS 占用的 token 数。编码时只保留 body + reserved <= max_seq_len
+    # 的文档；这个策略必须进入 cache id，避免和旧版“截断”缓存混用。
+    reserved_tokens = int(train_config.prepend_bos) + int(train_config.append_eos)
+
+    # cache id 由 tokenizer / 序列长度 / 分桶 / 采样种子 / BOS/EOS 策略决定，
+    # 与模型结构无关，因此换模型大小可以直接复用同一份缓存。
+    hash_input = (f"{len(tokenizer)}_{max_seq_len}_None_{train_config.seed}_5000"
+                  f"_rsv{reserved_tokens}")
     for b in bucket_boundaries:
         hash_input += f"_{b}"
     cache_id = hashlib.md5(hash_input.encode()).hexdigest()[:16]
@@ -2791,6 +2843,7 @@ def main():
         data_dir=data_dir, tokenizer=tokenizer, max_seq_len=max_seq_len,
         seed=train_config.seed,
         max_samples=train_config.test_samples if train_config.test_mode else None,
+        reserved_tokens=reserved_tokens,
     )
 
     dataset = FlatTokenDataset(flat_cache)
@@ -2835,7 +2888,7 @@ def main():
         if train_config.append_eos:
             parts.append(f"末尾加 <eos> id={tokenizer.eos_token_id}")
         print("✓ BOS/EOS 监督: 开（" + "；".join(parts) +
-              f"；超长样本截断正文以保持宽度 ≤{max_seq_len}）")
+              f"；超长文档编码时丢弃，不截断）")
     else:
         print("✓ BOS/EOS 监督: 关（模型不会主动开始/结束文档）")
 

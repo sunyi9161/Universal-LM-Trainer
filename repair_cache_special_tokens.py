@@ -15,9 +15,9 @@
 只重写受影响的桶：
   1. 用“普通编码器”decode 原始样本（id 2/3 会显示成字面 <bos>/<eos>）；
   2. 再用普通编码器 encode 回 token；
-  3. 若新长度超过该桶上限，截断到桶上限。
-样本数、桶划分、counts 完全不变，因此 checkpoint 的 counts_md5 不受影响，
---resume 仍然严格按“样本序号”续训，不重复也不遗漏。
+  3. 若新长度超过该桶上限，直接丢弃该样本（不截断）。
+注意：丢弃样本会改变桶内样本数，checkpoint 的 counts_md5 可能不再匹配，
+修复后需要从头训练或重新建立恢复点。
 重写前会把旧文件改名为 *.orig，可用 --restore 回滚。
 
 用法
@@ -71,6 +71,7 @@ def _rebuild(toks_path, offs_path, boundary, plain):
     positions = _scan_positions(toks)
     sis = _affected_samples(offs, positions)
     fixed = {}
+    dropped = set()
     changes = []
     for si in sis:
         a, z = int(offs[si]), int(offs[si + 1])
@@ -79,26 +80,35 @@ def _rebuild(toks_path, offs_path, boundary, plain):
         new = plain.encode(text).ids
         raw_len = len(new)
         if raw_len > boundary:
-            new = new[:boundary]
+            # 与训练脚本一致：超长文档直接丢弃，不截断。
+            dropped.add(si)
+            changes.append((si, len(old), 0, raw_len))
+            continue
         assert 2 not in new and 3 not in new, (si, len(new))
         fixed[si] = np.asarray(new, dtype=np.uint16)
         changes.append((si, len(old), len(new), raw_len))
 
-    new_total = len(toks) + sum(len(v) - int(offs[i + 1] - offs[i])
-                               for i, v in fixed.items())
+    new_total = (len(toks)
+                 - sum(int(offs[i + 1] - offs[i]) for i in dropped)
+                 + sum(len(v) - int(offs[i + 1] - offs[i])
+                       for i, v in fixed.items()))
     out = np.empty(new_total, dtype=np.uint16)
-    new_offs = np.empty(n + 1, dtype=np.int64)
-    new_offs[0] = 0
+    new_offs = np.zeros(n - len(dropped) + 1, dtype=np.int64)
     pos = 0
+    k = 0
     for i in range(n):
+        if i in dropped:
+            continue
         arr = fixed.get(i)
         if arr is None:
             a, z = int(offs[i]), int(offs[i + 1])
             arr = toks[a:z]
         out[pos:pos + len(arr)] = arr
         pos += len(arr)
-        new_offs[i + 1] = pos
+        k += 1
+        new_offs[k] = pos
     assert pos == new_total
+    assert k == n - len(dropped)
     return out, new_offs, changes
 
 
@@ -269,8 +279,8 @@ def main():
         out, new_offs, changes = _rebuild(toks_path, offs_path, B, plain)
         for si, old_len, new_len, raw_len in changes:
             note = ''
-            if raw_len > B:
-                note = f'（重编码后 {raw_len}，截断到桶上限 {B}）'
+            if new_len == 0:
+                note = f'（重编码后 {raw_len} > 桶上限 {B}，已丢弃）'
             print(f'  sample {si}: {old_len} -> {new_len}{note}')
         tmp_tok = _atomic_write_tokens(toks_path, out)
         tmp_off = _atomic_write_offsets(offs_path, new_offs)
@@ -279,6 +289,7 @@ def main():
         os.replace(offs_path, offs_path + '.orig')
         os.replace(tmp_tok, toks_path)
         os.replace(tmp_off, offs_path)
+        manifest['buckets'][bstr]['num_samples'] = int(len(new_offs) - 1)
         manifest['buckets'][bstr]['num_tokens'] = int(len(out))
         _write_manifest(manifest_path, manifest)
         print(f'✓ bucket {B}: tokens {len(toks):,} -> {len(out):,}')

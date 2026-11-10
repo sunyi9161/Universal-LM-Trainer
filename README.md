@@ -22,6 +22,8 @@
 - **BOS/EOS 监督**：每个样本编码为 `[BOS] + 正文 + [EOS]`，可用
   `--no-bos` / `--no-eos` 关闭；文本里字面出现的 `<bos>` / `<eos>` 按普通
   BPE 处理，不会被当成特殊 token。
+- **超长文档直接丢弃**：编码时只保留 `正文 + BOS/EOS <= max_seq_len` 的文档，
+  超长文档不会进入缓存，也不会在 collate 阶段被截断。
 - **可恢复训练**：Ctrl+C 菜单保存完整状态（模型 / 优化器 / scaler / 调度器 /
   RNG / 已消费样本位置），`--resume` 严格不重不漏；数据指纹不匹配时拒绝恢复。
 - **推理与评分**：流式生成、重复惩罚、禁止重复 n-gram、分块困惑度评分。
@@ -85,7 +87,8 @@ FA_V100_DISABLE=1 python train.py
 {"text": "一篇完整文档的正文……"}
 ```
 
-每个样本会被当成一篇完整文档，按 `max_seq_len` 截断正文。
+每个样本会被当成一篇完整文档。`正文 + BOS + EOS` 超过 `max_seq_len` 的文档
+会在编码时直接丢弃，不会截断后混进训练集。
 
 ### 2. 选配置
 
@@ -206,7 +209,7 @@ model = AutoModelForCausalLM.from_pretrained(
 | `target_tokens` | 每个微批的 token 预算 |
 | `max_micro_batch` | 微批样本数上限（也等于每步最大样本数） |
 | `test_samples` | `--test-mode` 时最多使用的样本数 |
-| `prepend_bos` / `append_eos` | 是否加 BOS / EOS 监督 |
+| `prepend_bos` / `append_eos` | 是否加 BOS / EOS 监督；两者都开时正文最长 `max_seq_len - 2`，超长文档编码时丢弃 |
 | `max_steps` | >0 时只跑指定 step 数 |
 
 ### `tokenizer`
@@ -247,25 +250,19 @@ python train.py \
 
 ## 缓存与换模型
 
-缓存 ID 只由 `tokenizer 大小 + max_seq_len + 分桶边界 + seed` 决定，**与模型结构
-无关**。因此：
+缓存 ID 由 `tokenizer 大小 + max_seq_len + 分桶边界 + seed + BOS/EOS 保留 token 数`
+决定，**与模型结构无关**。因此：
 
-- 用同一份 tokenizer / `max_seq_len` / `seed` 训练不同大小的模型，可以直接复用
-  同一份缓存；
-- 换 tokenizer、改 `max_seq_len` 或改 `seed` 会生成新的 `cache_id`，旧缓存不会被
-  误用；
+- 用同一份 tokenizer / `max_seq_len` / `seed` / BOS/EOS 设置训练不同大小的模型，
+  可以直接复用同一份缓存；
+- 换 tokenizer、改 `max_seq_len`、改 `seed`，或切换 `--no-bos` / `--no-eos`，
+  都会生成新的 `cache_id`，旧缓存不会被误用；
 - `--resume` 会校验数据指纹（tokenizer + 分桶计数 + BOS/EOS 开关），不匹配就
   拒绝恢复，避免 token id 错位。
 
-例如要把之前 `data/bucketed_cache_streaming_4096` 下的缓存接到本仓库：
-
-```bash
-python train.py --config config.json \
-    --cache-dir data/bucketed_cache_streaming_4096
-```
-
-只要 `tokenizer.json`、`max_seq_len=4096`、`seed=42`、BOS/EOS 设置与旧训练一致，
-`cache_id` 就会完全一致，直接复用 20GB 平铺缓存。
+> 注意：旧版项目采用“超长文档截断正文”的策略，缓存里可能存在长度正好等于桶上限
+> 的样本。本版本改为编码时丢弃超长文档，因此旧缓存不能直接复用；直接运行
+> `train.py` 会在同一 `cache_dir` 下生成新的 `<cache_id>` 目录，不会删除旧缓存。
 
 ## 性能与环境变量
 
