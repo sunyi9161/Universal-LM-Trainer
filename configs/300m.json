@@ -1,0 +1,49 @@
+{
+  "model": {
+    "d_model": 1024,
+    "n_heads": 16,
+    "n_layers": 24,
+    "d_ff": 4096,
+    "max_seq_len": 4096,
+    "dropout": 0.1,
+    "use_rope": true,
+    "tie_weights": true,
+    "use_gradient_checkpointing": false
+  },
+  "training": {
+    "batch_size": 32,
+    "gradient_accumulation_steps": 1,
+    "epochs": 1,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "warmup_steps": 3000,
+    "min_lr_ratio": 0.1,
+    "save_every": 1,
+    "log_every": 50,
+    "num_workers": 8,
+    "prefetch_factor": 4,
+    "seed": 42,
+    "use_fp16": true,
+    "use_compile": true,
+    "fused_optimizer": true,
+    "ce_chunk_rows": 1024,
+    "target_tokens": 12288,
+    "max_micro_batch": 32,
+    "test_samples": 100000,
+    "prepend_bos": true,
+    "append_eos": true,
+    "max_steps": 0
+  },
+  "tokenizer": {
+    "vocab_size": 65536,
+    "path": "tokenizer.json",
+    "max_bytes": 300000000,
+    "min_frequency": 2
+  },
+  "paths": {
+    "data_dir": "data",
+    "cache_dir": "cache",
+    "checkpoint_dir": "checkpoints"
+  }
+}

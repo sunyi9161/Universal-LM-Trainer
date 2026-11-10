@@ -1,0 +1,13 @@
+# 训练 / 推理核心依赖
+torch>=2.1
+tokenizers>=0.15
+numpy
+tqdm
+psutil
+
+# FlashAttention Triton 版本（可选；V100 推荐用 csrc 里的 CUDA 扩展）
+triton
+
+# 导出 / 加载 Hugging Face 模型（可选）
+transformers>=4.45
+safetensors

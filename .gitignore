@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Model weights / checkpoints
+checkpoints/
+hf_model/
+hf_model_*/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Tokenizer artifacts (regenerate with train.py)
+tokenizer.json
+tokenizer.json.bak
+*.jsonl
+data/
+
+# CUDA build artifacts
+csrc/**/build/
+*.so
+*.o
+*.obj
+
+# Logs / runtime
+*.log
+*.tmp
+nohup.out
+
+# Backups
+*.bak
+*.old
